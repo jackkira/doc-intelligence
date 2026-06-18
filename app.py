@@ -25,22 +25,30 @@ def get_client():
 
 
 def embed(texts: list[str]) -> np.ndarray:
-    resp = get_client().embeddings.create(model="text-embedding-3-small", input=texts)
-    return np.array([r.embedding for r in resp.data], dtype="float32")
+    client = get_client()
+    all_vecs = []
+    for i in range(0, len(texts), 100):
+        batch = texts[i:i+100]
+        resp = client.embeddings.create(model="text-embedding-3-small", input=batch)
+        all_vecs.extend([r.embedding for r in resp.data])
+    vecs = np.array(all_vecs, dtype="float32")
+    faiss.normalize_L2(vecs)
+    return vecs
 
 
 def build_index(text: str):
-    chunks = [text[i:i+500] for i in range(0, len(text), 500)]
+    size, overlap = 1000, 200
+    chunks = [text[i:i+size] for i in range(0, len(text), size - overlap)]
     vecs = embed(chunks)
-    index = faiss.IndexFlatL2(vecs.shape[1])
+    index = faiss.IndexFlatIP(vecs.shape[1])
     index.add(vecs)
     return index, chunks
 
 
-def retrieve(question: str, index, chunks: list[str], k: int = 4) -> str:
+def retrieve(question: str, index, chunks: list[str], k: int = 5) -> str:
     vec = embed([question])
     _, ids = index.search(vec, k)
-    return "\n\n".join(chunks[i] for i in ids[0])
+    return "\n\n".join(chunks[i] for i in ids[0] if i < len(chunks))
 
 
 def call_llm(prompt: str) -> str:
@@ -62,9 +70,10 @@ def extract_rules(text: str) -> str:
 def answer_question(question: str, index, chunks: list[str]) -> str:
     context = retrieve(question, index, chunks)
     return call_llm(
-        "Answer the question using ONLY the context below. "
-        "If the answer is not present, say: 'I cannot find that information in the document.'\n\n"
-        f"CONTEXT:\n{context}\n\nQUESTION: {question}"
+        "You are an assistant answering questions about a document. "
+        "Use the document excerpts below to answer the question. "
+        "If the answer cannot be found in the excerpts, say so.\n\n"
+        f"DOCUMENT EXCERPTS:\n{context}\n\nQUESTION: {question}"
     )
 
 
