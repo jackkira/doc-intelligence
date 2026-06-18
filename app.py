@@ -1,9 +1,10 @@
-import streamlit as st
+import io
+import numpy as np
+import faiss
 import openai
 import pypdf
 import docx
-import io
-import tiktoken
+import streamlit as st
 
 st.set_page_config(page_title="Document Intelligence", layout="wide")
 
@@ -16,49 +17,58 @@ def parse_document(file) -> str:
     elif name.endswith(".docx"):
         doc = docx.Document(io.BytesIO(file.read()))
         return "\n".join(p.text for p in doc.paragraphs)
-    else:
-        return file.read().decode("utf-8", errors="ignore")
+    return file.read().decode("utf-8", errors="ignore")
 
 
-def maybe_truncate(text: str, max_tokens: int = 100_000) -> str:
-    enc = tiktoken.encoding_for_model("gpt-4o")
-    tokens = enc.encode(text)
-    if len(tokens) > max_tokens:
-        return enc.decode(tokens[:max_tokens])
-    return text
+def get_client():
+    return openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 
-def call_openai(prompt: str) -> str:
-    client = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-    response = client.chat.completions.create(
+def embed(texts: list[str]) -> np.ndarray:
+    resp = get_client().embeddings.create(model="text-embedding-3-small", input=texts)
+    return np.array([r.embedding for r in resp.data], dtype="float32")
+
+
+def build_index(text: str):
+    chunks = [text[i:i+500] for i in range(0, len(text), 500)]
+    vecs = embed(chunks)
+    index = faiss.IndexFlatL2(vecs.shape[1])
+    index.add(vecs)
+    return index, chunks
+
+
+def retrieve(question: str, index, chunks: list[str], k: int = 4) -> str:
+    vec = embed([question])
+    _, ids = index.search(vec, k)
+    return "\n\n".join(chunks[i] for i in ids[0])
+
+
+def call_llm(prompt: str) -> str:
+    resp = get_client().chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
     )
-    return response.choices[0].message.content
+    return resp.choices[0].message.content
 
 
 def extract_rules(text: str) -> str:
-    prompt = (
-        "Read the document below and extract every explicit rule, policy, constraint, "
-        "or requirement stated in it. Output a numbered list only — one rule per line. "
-        "Do not infer or add rules that are not directly stated in the document.\n\n"
+    return call_llm(
+        "Extract every explicit rule, policy, constraint, or requirement from the document below. "
+        "Output a numbered list only — one rule per line. Do not infer rules not stated in the document.\n\n"
         f"DOCUMENT:\n{text}"
     )
-    return call_openai(prompt)
 
 
-def answer_question(text: str, question: str) -> str:
-    prompt = (
-        "Answer the question using ONLY the information in the document below. "
-        "If the answer is not present in the document, say: "
-        "'I cannot find that information in the document.'\n\n"
-        f"DOCUMENT:\n{text}\n\n"
-        f"QUESTION: {question}"
+def answer_question(question: str, index, chunks: list[str]) -> str:
+    context = retrieve(question, index, chunks)
+    return call_llm(
+        "Answer the question using ONLY the context below. "
+        "If the answer is not present, say: 'I cannot find that information in the document.'\n\n"
+        f"CONTEXT:\n{context}\n\nQUESTION: {question}"
     )
-    return call_openai(prompt)
 
 
-# ── UI ──────────────────────────────────────────────────────────────────────
+# ── UI ───────────────────────────────────────────────────────────────────────
 
 st.title("Document Intelligence")
 st.caption("Upload a document to extract its rules and ask questions about it.")
@@ -66,15 +76,12 @@ st.caption("Upload a document to extract its rules and ask questions about it.")
 uploaded = st.file_uploader("Upload a document", type=["pdf", "docx", "txt"])
 
 if uploaded:
-    if "doc_name" not in st.session_state or st.session_state.doc_name != uploaded.name:
-        with st.spinner("Reading document and extracting rules..."):
+    if st.session_state.get("doc_name") != uploaded.name:
+        with st.spinner("Processing document..."):
             text = parse_document(uploaded)
-            text = maybe_truncate(text)
+            index, chunks = build_index(text)
             rules = extract_rules(text)
-        st.session_state.doc_name = uploaded.name
-        st.session_state.doc_text = text
-        st.session_state.rules = rules
-        st.session_state.qa_history = []
+        st.session_state.update(doc_name=uploaded.name, index=index, chunks=chunks, rules=rules, qa_history=[])
 
     st.divider()
     left, right = st.columns(2)
@@ -85,10 +92,10 @@ if uploaded:
 
     with right:
         st.subheader("Ask a Question")
-        question = st.text_input("Your question", key="question_input")
+        question = st.text_input("Your question", key="q")
         if st.button("Ask") and question.strip():
             with st.spinner("Thinking..."):
-                answer = answer_question(st.session_state.doc_text, question)
+                answer = answer_question(question, st.session_state.index, st.session_state.chunks)
             st.session_state.qa_history.append((question, answer))
 
         for q, a in reversed(st.session_state.qa_history):
